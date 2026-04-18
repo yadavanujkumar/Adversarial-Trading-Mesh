@@ -12,26 +12,29 @@ Responsibilities
 * Apply the consensus gate: Bull > BULL_THRESHOLD AND Bear < BEAR_THRESHOLD.
 * Compute position size using a Kelly-fraction heuristic.
 * Emit a TradeDecision (BUY / HOLD / REJECT).
+* When action is BUY and Alpaca is enabled, submit the order.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from src.circuit_breaker import openai_circuit
+from src.config import settings
 from src.memory import format_lessons_for_prompt
+from src.metrics import metrics
 from src.state import SwarmState, TradeDecision
 
 logger = logging.getLogger(__name__)
 
-BULL_THRESHOLD = float(os.getenv("BULL_THRESHOLD", "0.8"))
-BEAR_THRESHOLD = float(os.getenv("BEAR_THRESHOLD", "0.3"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.02"))
+BULL_THRESHOLD = settings.bull_threshold
+BEAR_THRESHOLD = settings.bear_threshold
+STOP_LOSS_PCT = settings.stop_loss_pct
 
 
 # ── Kelly-fraction position sizing ───────────────────────────────────────────
@@ -137,11 +140,11 @@ async def run_judge_agent(state: SwarmState) -> dict[str, Any]:
         f"Bear's Rationale  : {state.get('risk_metadata', {}).get('bear_rationale', '—')}\n"
     )
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    llm = ChatOpenAI(model=settings.llm_model, temperature=0.0)
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_content)]
 
     try:
-        response = await llm.ainvoke(messages)
+        response = await openai_circuit.call(llm.ainvoke, messages)
         raw = response.content.strip()
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         parsed = json.loads(json_match.group()) if json_match else {}
@@ -168,5 +171,14 @@ async def run_judge_agent(state: SwarmState) -> dict[str, Any]:
         "Judge decision=%s  bull=%.3f  bear=%.3f  pos=%.3f",
         hard_action, bull, bear, position_size,
     )
+
+    # Track decision metrics
+    metrics.increment(f"decisions_{hard_action.lower()}_total")
+
+    # Submit order to Alpaca when enabled and action is BUY
+    if hard_action == "BUY" and settings.alpaca_enabled:
+        from src.execution.alpaca_broker import submit_order  # noqa: PLC0415
+        order_result = await submit_order(decision, snap["symbol"])
+        logger.info("Alpaca order result: %s", order_result)
 
     return {"final_decision": decision}
