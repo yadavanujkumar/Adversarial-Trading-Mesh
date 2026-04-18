@@ -166,10 +166,30 @@ class CircuitBreaker:
             self._state = CircuitState.CLOSED
             self._failures = 0
 
-
 # ── Module-level circuit breakers ─────────────────────────────────────────────
 # Imported by agents and the Exa.ai sentiment fetcher.
+# Thresholds and timeouts come from the centralised settings so operators can
+# tune them via environment variables without touching code.
 
-openai_circuit = CircuitBreaker("openai", failure_threshold=5, recovery_timeout=60.0)
-exa_circuit = CircuitBreaker("exa_ai", failure_threshold=3, recovery_timeout=30.0)
-alpaca_circuit = CircuitBreaker("alpaca", failure_threshold=3, recovery_timeout=30.0)
+def _build_circuits() -> tuple["CircuitBreaker", "CircuitBreaker", "CircuitBreaker"]:
+    from src.config import settings  # noqa: PLC0415 — avoid circular import at module level
+    return (
+        CircuitBreaker(
+            "openai",
+            failure_threshold=settings.circuit_breaker_threshold,
+            recovery_timeout=settings.circuit_breaker_timeout_secs,
+        ),
+        CircuitBreaker(
+            "exa_ai",
+            failure_threshold=max(1, settings.circuit_breaker_threshold - 2),
+            recovery_timeout=settings.circuit_breaker_timeout_secs / 2,
+        ),
+        CircuitBreaker(
+            "alpaca",
+            failure_threshold=max(1, settings.circuit_breaker_threshold - 2),
+            recovery_timeout=settings.circuit_breaker_timeout_secs / 2,
+        ),
+    )
+
+
+openai_circuit, exa_circuit, alpaca_circuit = _build_circuits()

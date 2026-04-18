@@ -226,8 +226,6 @@ async def _run_dashboard() -> None:
         log_level="warning",
     )
     server = uvicorn.Server(config)
-    # Honour our own shutdown event instead of waiting for SIGINT
-    server.handle_exit = lambda sig, frame: _shutdown_event.set()  # type: ignore[method-assign]
     await server.serve()
 
 

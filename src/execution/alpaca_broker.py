@@ -31,6 +31,7 @@ Safety guardrails
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -43,15 +44,23 @@ logger = logging.getLogger(__name__)
 # Absolute maximum single-trade notional in USD — a hard safety guardrail.
 MAX_NOTIONAL_USD = 10_000.0
 
+# Alpaca SDK classes — imported lazily so the heavy SDK is only loaded when needed.
+try:
+    from alpaca.trading.client import TradingClient  # type: ignore[import]
+    from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest  # type: ignore[import]
+    from alpaca.trading.enums import OrderSide, TimeInForce  # type: ignore[import]
+    _ALPACA_AVAILABLE = True
+except ImportError:
+    _ALPACA_AVAILABLE = False
+
 
 def _get_trading_client() -> Any:
     """
-    Lazily import and return an Alpaca TradingClient.
-
-    Lazy import keeps startup fast when alpaca_enabled is False and avoids
-    importing the heavy alpaca-py SDK unless it is actually needed.
+    Return an Alpaca TradingClient using the configured credentials.
+    Raises ImportError if alpaca-py is not installed.
     """
-    from alpaca.trading.client import TradingClient  # type: ignore[import]
+    if not _ALPACA_AVAILABLE:
+        raise ImportError("alpaca-py is not installed. Run: pip install alpaca-py")
     return TradingClient(
         api_key=settings.alpaca_api_key,
         secret_key=settings.alpaca_secret_key,
@@ -60,9 +69,9 @@ def _get_trading_client() -> Any:
 
 
 async def _fetch_portfolio_value(client: Any) -> float:
-    """Return current portfolio equity in USD from Alpaca."""
+    """Return current portfolio equity in USD from Alpaca (sync SDK wrapped in thread)."""
     try:
-        account = client.get_account()
+        account = await asyncio.to_thread(client.get_account)
         return float(account.equity)
     except Exception as exc:
         logger.warning("Could not fetch portfolio value from Alpaca: %s", exc)
@@ -99,9 +108,6 @@ async def submit_order(decision: TradeDecision, symbol: str) -> dict[str, Any]:
         return {"status": "error", "reason": "missing_credentials"}
 
     async def _execute() -> dict[str, Any]:
-        from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest  # type: ignore
-        from alpaca.trading.enums import OrderSide, TimeInForce  # type: ignore
-
         client = _get_trading_client()
         portfolio_value = await _fetch_portfolio_value(client)
 
@@ -115,14 +121,14 @@ async def submit_order(decision: TradeDecision, symbol: str) -> dict[str, Any]:
         if notional < 1.0:
             return {"status": "skipped", "reason": f"notional_too_small: ${notional:.2f}"}
 
-        # Submit market buy order
+        # Submit market buy order (sync SDK call wrapped in thread)
         buy_req = MarketOrderRequest(
             symbol=symbol.upper(),
             notional=round(notional, 2),
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
         )
-        buy_order = client.submit_order(order_data=buy_req)
+        buy_order = await asyncio.to_thread(client.submit_order, order_data=buy_req)
         logger.info(
             "Alpaca BUY submitted: symbol=%s  notional=$%.2f  order_id=%s",
             symbol.upper(), notional, buy_order.id,
@@ -139,7 +145,7 @@ async def submit_order(decision: TradeDecision, symbol: str) -> dict[str, Any]:
                 time_in_force=TimeInForce.GTC,
                 stop_price=round(stop_price, 4),
             )
-            stop_order = client.submit_order(order_data=stop_req)
+            stop_order = await asyncio.to_thread(client.submit_order, order_data=stop_req)
             stop_order_id = str(stop_order.id)
             logger.info(
                 "Alpaca STOP submitted: stop_price=%.4f  order_id=%s",

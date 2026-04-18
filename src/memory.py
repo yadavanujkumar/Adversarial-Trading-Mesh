@@ -23,12 +23,15 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from src.config import Settings
 
 logger = logging.getLogger(__name__)
 
 # Lazy import to avoid circular dependency at module load time
-def _get_settings() -> Any:
+def _get_settings() -> "Settings":
     from src.config import settings  # noqa: PLC0415
     return settings
 

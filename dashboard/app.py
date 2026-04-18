@@ -33,7 +33,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -58,7 +58,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production by setting CORS_ORIGINS env var
+    allow_origins=["*"],  # restrict in production — set at the reverse proxy or load balancer
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -78,11 +78,11 @@ MAX_WS_CONNECTIONS = 50  # hard cap on concurrent WebSocket subscribers
 _trigger_requests: deque[float] = deque(maxlen=settings.api_rate_limit_rpm)
 
 
-def _check_rate_limit(client_ip: str) -> None:
+def _check_rate_limit() -> None:
     """
     Sliding-window rate limiter: allows settings.api_rate_limit_rpm requests
-    per 60-second window across *all* callers (per-IP limiting would need a
-    more sophisticated store — use a reverse proxy / API gateway for that).
+    per 60-second window across *all* callers combined.
+    For per-IP limiting, delegate to a reverse proxy or API gateway.
     """
     now = time.monotonic()
     # Purge requests older than 60 s
@@ -415,7 +415,6 @@ class ManualTriggerPayload(BaseModel):
 @app.post("/api/trigger")
 async def api_trigger(
     payload: ManualTriggerPayload,
-    request: Request,
     x_api_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """
@@ -425,8 +424,7 @@ async def api_trigger(
     Rate-limited to settings.api_rate_limit_rpm requests/minute.
     Optional authentication via X-API-Token header.
     """
-    client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
+    _check_rate_limit()
     _check_auth(x_api_token)
 
     from src.graph import trading_graph  # noqa: PLC0415
