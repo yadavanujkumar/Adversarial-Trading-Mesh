@@ -25,6 +25,8 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from src.circuit_breaker import openai_circuit
+from src.config import settings
 from src.memory import format_lessons_for_prompt
 from src.state import MarketSnapshot, RiskMetadata, SwarmState
 
@@ -178,11 +180,11 @@ async def run_bear_agent(state: SwarmState) -> dict[str, Any]:
         f"{state.get('bull_rationale', 'not yet available')}"
     )
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+    llm = ChatOpenAI(model=settings.llm_model, temperature=0.1)
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_content)]
 
     try:
-        response = await llm.ainvoke(messages)
+        response = await openai_circuit.call(llm.ainvoke, messages)
         raw = response.content.strip()
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         parsed = json.loads(json_match.group()) if json_match else {}

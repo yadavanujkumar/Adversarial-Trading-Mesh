@@ -71,26 +71,72 @@ A single LLM asked to make trading decisions tends to either hallucinate bullish
 
 ```
 Adversarial-Trading-Mesh/
-├── main.py                     # Entry point: asyncio event loop
+├── main.py                     # Entry point: asyncio event loop + graceful shutdown
 ├── requirements.txt            # Python dependencies
-├── .env.example                # Environment variable template
+├── .env.example                # Environment variable template (fully documented)
 │
 ├── src/
 │   ├── __init__.py
+│   ├── config.py               # Pydantic Settings — centralised, validated configuration
+│   ├── metrics.py              # In-process counters + latency histograms
+│   ├── circuit_breaker.py      # Async circuit breaker (OpenAI / Exa.ai / Alpaca)
 │   ├── state.py                # TypedDict: SwarmState, MarketSnapshot, RiskMetadata …
-│   ├── memory.py               # JSON-backed persistent agent lesson store
+│   ├── memory.py               # Async-safe JSON-backed persistent agent lesson store
 │   ├── graph.py                # LangGraph workflow (parallel Bull/Bear + Post-Mortem)
 │   ├── websocket_feed.py       # Binance WebSocket → MarketSnapshot (RSI/MACD incremental)
-│   └── agents/
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   ├── bull_agent.py       # Agent A — momentum + Exa.ai sentiment
+│   │   ├── bear_agent.py       # Agent B — OBI + liquidity trap + Black Swan
+│   │   └── judge_agent.py      # Agent C — Kelly sizing + consensus gate + Alpaca execution
+│   └── execution/
 │       ├── __init__.py
-│       ├── bull_agent.py       # Agent A — momentum + Exa.ai sentiment
-│       ├── bear_agent.py       # Agent B — OBI + liquidity trap + Black Swan
-│       └── judge_agent.py      # Agent C — Kelly sizing + consensus gate
+│       └── alpaca_broker.py    # Alpaca paper/live order execution with safety guardrails
 │
 └── dashboard/
     ├── __init__.py
     └── app.py                  # FastAPI: HTML dashboard + /api/* + /ws/live
 ```
+
+---
+
+## Enterprise-Grade Features
+
+### 🔒 Centralised, Validated Configuration (`src/config.py`)
+All environment variables are parsed and type-validated at startup via **Pydantic Settings**.  The application fails fast with a descriptive error rather than silently using wrong defaults.  Attempting to set `bull_threshold ≤ bear_threshold` raises a `ValidationError` immediately.
+
+### ⚡ Async Circuit Breakers (`src/circuit_breaker.py`)
+Three-state circuit breakers (CLOSED → OPEN → HALF-OPEN) guard every external API call:
+- **`openai_circuit`** — wraps all LLM calls across Bull, Bear, Judge, and Post-Mortem nodes.
+- **`exa_circuit`** — wraps Exa.ai neural search in the Bull agent.
+- **`alpaca_circuit`** — wraps Alpaca order submission.
+
+When a dependency fails 5 consecutive times the circuit opens and all subsequent calls are rejected immediately (fast-fail) for 60 s before a single recovery probe is attempted.  This prevents cascade failures and LLM API quota exhaustion under partial outages.
+
+### 📊 In-Process Metrics (`src/metrics.py`)
+Thread-safe counters and p50/p95/p99 latency histograms are maintained in-process with zero external dependencies.  Accessible at `/api/metrics` for scraping by Prometheus exporters or log aggregators.
+
+### 🏥 Health / Readiness Probes (`/api/health`)
+Returns HTTP **503** during initialisation and HTTP **200** once the first reasoning cycle completes — compatible with Kubernetes `readinessProbe` configuration so no traffic is routed until the swarm is warm.
+
+### 🛡️ Rate Limiting & Auth (`/api/trigger`)
+A sliding-window rate limiter caps `/api/trigger` at `API_RATE_LIMIT_RPM` requests per minute (default 30).  Set `API_AUTH_TOKEN` to require an `X-API-Token` header on all trigger calls.
+
+### 🔄 Graceful Shutdown (`main.py`)
+Registers `SIGINT` / `SIGTERM` handlers so the reasoning loop and dashboard drain cleanly when containerised (Docker, Kubernetes).
+
+### 📝 Structured JSON Logging
+Set `LOG_JSON=true` to emit machine-readable JSON log lines compatible with Datadog, Loki, and CloudWatch — no log-parsing configuration needed on the aggregation side.
+
+### 💼 Alpaca Order Execution (`src/execution/alpaca_broker.py`)
+When `ALPACA_ENABLED=true`, BUY decisions are automatically translated into real (or paper) market orders via the Alpaca API:
+- Position size computed from Kelly fraction × portfolio equity.
+- Hard notional cap (`MAX_NOTIONAL_USD = $10,000`) prevents runaway sizing bugs.
+- Stop-loss bracket order submitted alongside the buy.
+- Protected by `alpaca_circuit` — broker outages don't stall the reasoning pipeline.
+
+### 🧵 Async-Safe Persistent Memory (`src/memory.py`)
+The in-process `asyncio.Lock` prevents concurrent post-mortem lessons from corrupting the JSON store.  Atomic writes via `os.replace()` on a temp file ensure the file is never half-written.  An in-memory cache avoids repeated disk reads during every reasoning cycle.
 
 ---
 
@@ -109,7 +155,7 @@ Adversarial-Trading-Mesh/
 ### Agent Sigma — The Judge
 > *"You are the most emotionally detached entity in this room. You do not root for the Bull. You do not fear with the Bear. Adjectives are for analysts — you deal in decisions."*
 
-**Logic:** Hard-rules gate (cannot be overridden by LLM output) + Kelly half-fraction position sizing (capped at 25 % of portfolio).
+**Logic:** Hard-rules gate (cannot be overridden by LLM output) + Kelly half-fraction position sizing (capped at 25 % of portfolio) + optional Alpaca order submission.
 
 ---
 
@@ -155,6 +201,20 @@ curl -X POST http://localhost:8000/api/trigger \
   }'
 ```
 
+### Docker / Kubernetes
+```bash
+docker build -t aura-swarm-quant .
+docker run -e OPENAI_API_KEY=sk-... -p 8000:8000 aura-swarm-quant
+
+# Kubernetes readiness probe (waits for first cycle before routing traffic)
+readinessProbe:
+  httpGet:
+    path: /api/health
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+```
+
 ---
 
 ## Real-Time Integration
@@ -174,13 +234,28 @@ Technical indicators are computed **incrementally** on a rolling 50-price window
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | — | **Required.** Powers all three LLM agents. |
+| `LLM_MODEL` | `gpt-4o-mini` | OpenAI model identifier. |
+| `LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors. |
 | `EXA_API_KEY` | — | Optional. Enables live social sentiment in the Bull agent. |
+| `EXA_NUM_RESULTS` | `8` | Number of Exa.ai search results to fetch. |
 | `WS_SYMBOL` | `btcusdt` | Binance stream symbol. |
+| `WS_THROTTLE_SECS` | `1.0` | Minimum seconds between yielded snapshots. |
 | `BULL_THRESHOLD` | `0.8` | Minimum bull confidence for a BUY decision. |
 | `BEAR_THRESHOLD` | `0.3` | Maximum bear confidence allowed for a BUY decision. |
-| `STOP_LOSS_PCT` | `0.02` | Stop-loss distance below entry (e.g. `0.02` = 2 %). |
+| `STOP_LOSS_PCT` | `0.02` | Stop-loss distance below entry price (e.g. `0.02` = 2 %). |
+| `ALPACA_ENABLED` | `false` | Set `true` to submit real orders through Alpaca. |
+| `ALPACA_API_KEY` | — | Alpaca API key (required when enabled). |
+| `ALPACA_SECRET_KEY` | — | Alpaca secret key (required when enabled). |
+| `ALPACA_BASE_URL` | `https://paper-api.alpaca.markets` | Alpaca endpoint (change to live URL for real capital). |
 | `DASHBOARD_PORT` | `8000` | FastAPI dashboard port. |
+| `API_AUTH_TOKEN` | — | If set, `/api/trigger` requires `X-API-Token` header. |
+| `API_RATE_LIMIT_RPM` | `30` | Max `/api/trigger` requests per minute. |
+| `CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before a circuit opens. |
+| `CIRCUIT_BREAKER_TIMEOUT_SECS` | `60.0` | Seconds a circuit stays OPEN before recovery probe. |
 | `MEMORY_PATH` | `agent_memory.json` | Path for persistent lesson storage. |
+| `MEMORY_MAX_LESSONS` | `10` | Maximum lessons retained per agent. |
+| `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
+| `LOG_JSON` | `false` | Set `true` for structured JSON log output. |
 
 ---
 
@@ -188,13 +263,17 @@ Technical indicators are computed **incrementally** on a rolling 50-price window
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Auto-refreshing HTML war room view |
+| `/` | GET | Auto-refreshing HTML war room with signal bars, circuit breaker status, and session stats |
+| `/api/health` | GET | Liveness + readiness probe (HTTP 503 until first cycle, 200 after) |
+| `/api/metrics` | GET | In-process counters and latency percentiles |
+| `/api/circuit-breakers` | GET | Current state of all circuit breakers |
 | `/api/status` | GET | Latest reasoning cycle as JSON |
-| `/api/decisions` | GET | Last 100 trade decisions |
+| `/api/decisions` | GET | Last 100 trade decisions (`?limit=N` to paginate) |
 | `/api/memory/{agent}` | GET | Stored lessons for `bull`, `bear`, or `judge` |
-| `/api/trigger` | POST | Manually inject market data + trigger full cycle |
-| `/ws/live` | WS | Real-time push of each cycle result |
+| `/api/trigger` | POST | Manually inject market data + trigger full cycle (rate-limited) |
+| `/ws/live` | WS | Real-time push of each cycle result (heartbeat every 30 s) |
 | `/docs` | GET | Swagger UI |
+| `/redoc` | GET | ReDoc UI |
 
 ---
 
@@ -209,6 +288,9 @@ Technical indicators are computed **incrementally** on a rolling 50-price window
 | Technical indicators | incremental RSI/MACD (numpy) |
 | Monitoring API | `fastapi` + `uvicorn` |
 | Position sizing | Half-Kelly criterion |
+| Configuration | `pydantic-settings` |
+| Order execution | `alpaca-py` |
+| Resilience | Async circuit breakers (built-in) |
 
 ---
 

@@ -24,5 +24,9 @@ anyio>=4.4.0
 # Environment / config
 python-dotenv>=1.0.0
 
-# Serialisation
+# Serialisation + settings validation
 pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# Alpaca paper / live order execution (optional)
+alpaca-py>=0.30.0

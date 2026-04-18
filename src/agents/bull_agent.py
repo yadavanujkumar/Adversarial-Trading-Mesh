@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Any
 
@@ -25,14 +24,13 @@ import httpx
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from src.circuit_breaker import exa_circuit, openai_circuit
+from src.config import settings
 from src.memory import format_lessons_for_prompt
 from src.state import MarketSnapshot, SwarmState
 
 logger = logging.getLogger(__name__)
 
-# ── Exa.ai sentiment ─────────────────────────────────────────────────────────
-
-EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 EXA_ENDPOINT = "https://api.exa.ai/search"
 
 
@@ -43,24 +41,29 @@ async def _fetch_exa_sentiment(symbol: str) -> tuple[float, list[str]]:
 
     Returns (sentiment_score ∈ [–1, 1], list_of_headline_urls).
     Falls back to (0.0, []) when the API key is missing or the call fails.
+    The Exa.ai circuit breaker is applied to prevent hammering a failing endpoint.
     """
-    if not EXA_API_KEY:
+    if not settings.exa_api_key:
         logger.debug("EXA_API_KEY not set — skipping live sentiment fetch.")
         return 0.0, []
 
     query = f"{symbol} price prediction bullish bearish analysis"
     payload = {
         "query": query,
-        "numResults": 8,
+        "numResults": settings.exa_num_results,
         "useAutoprompt": True,
         "type": "neural",
     }
-    headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
-    try:
+    headers = {"x-api-key": settings.exa_api_key, "Content-Type": "application/json"}
+
+    async def _do_request() -> list[dict]:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(EXA_ENDPOINT, json=payload, headers=headers)
             resp.raise_for_status()
-            results = resp.json().get("results", [])
+            return resp.json().get("results", [])
+
+    try:
+        results = await exa_circuit.call(_do_request)
     except Exception as exc:
         logger.warning("Exa.ai call failed: %s", exc)
         return 0.0, []
@@ -192,11 +195,11 @@ async def run_bull_agent(state: SwarmState) -> dict[str, Any]:
         f"{state.get('risk_metadata', {}).get('bear_rationale', 'not yet available')}"
     )
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+    llm = ChatOpenAI(model=settings.llm_model, temperature=0.2)
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_content)]
 
     try:
-        response = await llm.ainvoke(messages)
+        response = await openai_circuit.call(llm.ainvoke, messages)
         raw = response.content.strip()
         # Extract JSON even if wrapped in markdown fences
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)

@@ -49,13 +49,17 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
-from src.memory import append_lesson, format_lessons_for_prompt
+from src.circuit_breaker import openai_circuit
+from src.config import settings
+from src.memory import async_append_lesson, format_lessons_for_prompt
+from src.metrics import metrics
 from src.state import PostMortemReport, SwarmState
 from src.agents.bull_agent import run_bull_agent
 from src.agents.bear_agent import run_bear_agent
@@ -90,6 +94,8 @@ async def ingest_market_data(state: SwarmState) -> dict[str, Any]:
         "Ingested %s @ %.4f  RSI=%.1f  OBI=%+.3f",
         clean["symbol"], clean["price"], clean["rsi_14"], clean["order_book_imbalance"],
     )
+
+    metrics.increment("market_snapshots_ingested_total")
 
     return {
         "market_data": clean,
@@ -156,11 +162,11 @@ async def post_mortem_node(state: SwarmState) -> dict[str, Any]:
         f"Judge Rationale:\n{decision.get('judge_rationale', '—')}\n"
     )
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+    llm = ChatOpenAI(model=settings.llm_model, temperature=0.3)
     messages = [SystemMessage(content=_POSTMORTEM_SYSTEM), HumanMessage(content=human_content)]
 
     try:
-        response = await llm.ainvoke(messages)
+        response = await openai_circuit.call(llm.ainvoke, messages)
         raw = response.content.strip()
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         parsed = json.loads(json_match.group()) if json_match else {}
@@ -172,7 +178,7 @@ async def post_mortem_node(state: SwarmState) -> dict[str, Any]:
             "failure_category": parsed.get("failure_category", "other"),
             "lessons_learned": parsed.get("lessons_learned", "No lessons extracted."),
             "updated_risk_weight": float(parsed.get("updated_risk_weight",
-                                                     os.getenv("BEAR_THRESHOLD", "0.3"))),
+                                                     settings.bear_threshold)),
         }
     except Exception as exc:
         logger.error("Post-mortem LLM call failed: %s", exc)
@@ -182,19 +188,22 @@ async def post_mortem_node(state: SwarmState) -> dict[str, Any]:
             loss_pct=round(loss_pct, 6),
             failure_category="other",
             lessons_learned=f"LLM unavailable: {exc}",
-            updated_risk_weight=float(os.getenv("BEAR_THRESHOLD", "0.3")),
+            updated_risk_weight=settings.bear_threshold,
         )
 
-    # Persist lessons to agent memory
+    # Persist lessons to agent memory (async-safe)
     lesson = {
         "category": report["failure_category"],
         "summary": report["lessons_learned"][:200],
         "loss_pct": report["loss_pct"],
         "risk_weight": report["updated_risk_weight"],
     }
-    append_lesson("bull", lesson)
-    append_lesson("bear", lesson)
-    append_lesson("judge", lesson)
+    await async_append_lesson("bull", lesson)
+    await async_append_lesson("bear", lesson)
+    await async_append_lesson("judge", lesson)
+
+    metrics.increment("post_mortems_total")
+    metrics.increment(f"post_mortem_{report['failure_category']}_total")
 
     logger.warning(
         "Post-mortem complete: category=%s  loss=%.2f%%  new_risk_weight=%.3f",
