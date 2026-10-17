@@ -171,7 +171,7 @@ class CircuitBreaker:
 # Thresholds and timeouts come from the centralised settings so operators can
 # tune them via environment variables without touching code.
 
-def _build_circuits() -> tuple["CircuitBreaker", "CircuitBreaker", "CircuitBreaker"]:
+def _build_circuits() -> tuple["CircuitBreaker", "CircuitBreaker", "CircuitBreaker", "CircuitBreaker"]:
     from src.config import settings  # noqa: PLC0415 — avoid circular import at module level
     return (
         CircuitBreaker(
@@ -189,7 +189,13 @@ def _build_circuits() -> tuple["CircuitBreaker", "CircuitBreaker", "CircuitBreak
             failure_threshold=max(1, settings.circuit_breaker_threshold - 2),
             recovery_timeout=settings.circuit_breaker_timeout_secs / 2,
         ),
+        # Independent from Exa: provider failures must not cross services.
+        CircuitBreaker(
+            "parallel_search",
+            failure_threshold=max(1, settings.circuit_breaker_threshold - 2),
+            recovery_timeout=settings.circuit_breaker_timeout_secs / 2,
+        ),
     )
 
 
-openai_circuit, exa_circuit, alpaca_circuit = _build_circuits()
+openai_circuit, exa_circuit, alpaca_circuit, parallel_circuit = _build_circuits()

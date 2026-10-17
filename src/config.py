@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(default=3, ge=1, le=10, description="LLM retry attempts on transient errors")
     llm_retry_delay_secs: float = Field(default=1.0, ge=0.0, description="Initial retry back-off in seconds")
 
+    # ── News sentiment ───────────────────────────────────────────────────────
+    sentiment_provider: Literal["auto", "parallel", "exa", "none"] = Field(
+        default="auto", description="auto keeps configured Exa keys, otherwise uses keyless Parallel MCP",
+    )
+    sentiment_timeout_secs: float = Field(default=8.0, ge=0.1, le=60.0)
+    sentiment_cache_secs: float = Field(default=60.0, ge=1.0, le=3600.0)
+
     # ── Exa.ai sentiment ─────────────────────────────────────────────────────
     exa_api_key: str = Field(default="", description="Exa.ai API key (optional, enables live sentiment)")
     exa_num_results: int = Field(default=8, ge=1, le=50)
@@ -112,6 +119,12 @@ class Settings(BaseSettings):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @property
+    def resolved_sentiment_provider(self) -> Literal["parallel", "exa", "none"]:
+        if self.sentiment_provider == "auto":
+            return "exa" if self.exa_api_key else "parallel"
+        return self.sentiment_provider
+
+    @property
     def memory_path_obj(self) -> Path:
         return Path(self.memory_path)
 
@@ -121,10 +134,8 @@ class Settings(BaseSettings):
             logger.warning(
                 "OPENAI_API_KEY is not set — LLM agents will fail on every call."
             )
-        if not self.exa_api_key:
-            logger.info(
-                "EXA_API_KEY not set — Bull agent will run without live sentiment."
-            )
+        if self.resolved_sentiment_provider == "exa" and not self.exa_api_key:
+            logger.info("EXA_API_KEY not set; selected Exa sentiment is disabled.")
         if self.alpaca_enabled and (not self.alpaca_api_key or not self.alpaca_secret_key):
             logger.warning(
                 "ALPACA_ENABLED=true but ALPACA_API_KEY / ALPACA_SECRET_KEY are missing."
