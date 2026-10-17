@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from src.circuit_breaker import openai_circuit, exa_circuit, alpaca_circuit
+from src.circuit_breaker import openai_circuit, exa_circuit, alpaca_circuit, parallel_circuit
 from src.config import settings
 from src.memory import get_lessons
 from src.metrics import metrics
@@ -177,6 +177,7 @@ async def root() -> str:
     cb_states = {
         "OpenAI": openai_circuit.state.value,
         "Exa.ai": exa_circuit.state.value,
+        "Parallel": parallel_circuit.state.value,
         "Alpaca": alpaca_circuit.state.value,
     }
     cb_html = " &nbsp;·&nbsp; ".join(
@@ -349,7 +350,7 @@ async def api_health() -> JSONResponse:
     Returns HTTP 503 while the system is still initialising, so a
     Kubernetes readiness probe won't route traffic until the swarm is warm.
     """
-    cb_ok = not any(cb.is_open for cb in [openai_circuit, exa_circuit, alpaca_circuit])
+    cb_ok = not any(cb.is_open for cb in [openai_circuit, exa_circuit, alpaca_circuit, parallel_circuit])
     status = {
         "status": "ok" if _first_cycle_complete else "initialising",
         "ready": _first_cycle_complete,
@@ -375,6 +376,7 @@ async def api_circuit_breakers() -> list[dict[str, Any]]:
     return [
         openai_circuit.status(),
         exa_circuit.status(),
+        parallel_circuit.status(),
         alpaca_circuit.status(),
     ]
 

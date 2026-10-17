@@ -10,7 +10,7 @@ opportunity in front of it.
 Responsibilities
 ----------------
 * Evaluate RSI / MACD momentum signals.
-* Query Exa.ai for real-time news & social sentiment.
+* Query the configured provider for news headline sentiment.
 * Output a bull_signal ∈ [0, 1] representing conviction in a long entry.
 """
 from __future__ import annotations
@@ -20,70 +20,16 @@ import logging
 import re
 from typing import Any
 
-import httpx
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from src.circuit_breaker import exa_circuit, openai_circuit
+from src.circuit_breaker import openai_circuit
 from src.config import settings
 from src.memory import format_lessons_for_prompt
 from src.state import MarketSnapshot, SwarmState
+from src.sentiment import fetch_sentiment
 
 logger = logging.getLogger(__name__)
-
-EXA_ENDPOINT = "https://api.exa.ai/search"
-
-
-async def _fetch_exa_sentiment(symbol: str) -> tuple[float, list[str]]:
-    """
-    Call Exa.ai to retrieve recent headlines about *symbol* and compute a
-    naïve sentiment score by counting bullish vs. bearish keywords.
-
-    Returns (sentiment_score ∈ [–1, 1], list_of_headline_urls).
-    Falls back to (0.0, []) when the API key is missing or the call fails.
-    The Exa.ai circuit breaker is applied to prevent hammering a failing endpoint.
-    """
-    if not settings.exa_api_key:
-        logger.debug("EXA_API_KEY not set — skipping live sentiment fetch.")
-        return 0.0, []
-
-    query = f"{symbol} price prediction bullish bearish analysis"
-    payload = {
-        "query": query,
-        "numResults": settings.exa_num_results,
-        "useAutoprompt": True,
-        "type": "neural",
-    }
-    headers = {"x-api-key": settings.exa_api_key, "Content-Type": "application/json"}
-
-    async def _do_request() -> list[dict]:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(EXA_ENDPOINT, json=payload, headers=headers)
-            resp.raise_for_status()
-            return resp.json().get("results", [])
-
-    try:
-        results = await exa_circuit.call(_do_request)
-    except Exception as exc:
-        logger.warning("Exa.ai call failed: %s", exc)
-        return 0.0, []
-
-    bull_kw = {"bullish", "surge", "rally", "breakout", "buy", "uptrend", "momentum", "growth"}
-    bear_kw = {"bearish", "crash", "dump", "sell", "downtrend", "collapse", "risk", "fear"}
-
-    score = 0.0
-    sources: list[str] = []
-    for r in results:
-        title = (r.get("title") or "").lower()
-        sources.append(r.get("url", ""))
-        score += sum(1 for w in bull_kw if w in title)
-        score -= sum(1 for w in bear_kw if w in title)
-
-    # Normalise to [–1, 1]
-    max_possible = len(results) * max(len(bull_kw), len(bear_kw))
-    normalised = max(-1.0, min(1.0, score / max(max_possible, 1)))
-    return normalised, [s for s in sources if s]
-
 
 # ── Signal calculation ────────────────────────────────────────────────────────
 
@@ -166,7 +112,7 @@ async def run_bull_agent(state: SwarmState) -> dict[str, Any]:
     snap: MarketSnapshot = state["market_data"]
 
     # Parallel: fetch sentiment while computing technical score
-    sentiment_score, sentiment_sources = await _fetch_exa_sentiment(snap["symbol"])
+    sentiment_score, sentiment_sources = await fetch_sentiment(snap["symbol"])
 
     # Enrich snapshot with live sentiment (mutate a copy — state is immutable)
     enriched_snap: MarketSnapshot = {

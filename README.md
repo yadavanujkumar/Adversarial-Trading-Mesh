@@ -55,7 +55,7 @@ REJECT   iff  bear_signal ≥ 0.3  OR  bull_signal ≤ 0.8
 
 | Agent | Role | Signal | Personality |
 |-------|------|--------|-------------|
-| **Alpha (Bull)** | Entry strength analyst | `bull_signal ∈ [0,1]` | Forensically optimistic; backs momentum with RSI, MACD, and Exa.ai social sentiment |
+| **Alpha (Bull)** | Entry strength analyst | `bull_signal ∈ [0,1]` | Forensically optimistic; backs momentum with RSI, MACD, and news headline sentiment |
 | **Omega (Bear)** | Risk auditor | `bear_signal ∈ [0,1]` | Perpetually skeptical; hunts OBI manipulation, liquidity traps, and Black Swan events |
 | **Sigma (Judge)** | Executive arbiter | `TradeDecision` | Emotionally detached; enforces the consensus gate with no exceptions |
 
@@ -78,6 +78,7 @@ Adversarial-Trading-Mesh/
 ├── src/
 │   ├── __init__.py
 │   ├── config.py               # Pydantic Settings — centralised, validated configuration
+│   ├── sentiment.py            # Bull news provider selection + MCP transport/cache
 │   ├── metrics.py              # In-process counters + latency histograms
 │   ├── circuit_breaker.py      # Async circuit breaker (OpenAI / Exa.ai / Alpaca)
 │   ├── state.py                # TypedDict: SwarmState, MarketSnapshot, RiskMetadata …
@@ -86,7 +87,7 @@ Adversarial-Trading-Mesh/
 │   ├── websocket_feed.py       # Binance WebSocket → MarketSnapshot (RSI/MACD incremental)
 │   ├── agents/
 │   │   ├── __init__.py
-│   │   ├── bull_agent.py       # Agent A — momentum + Exa.ai sentiment
+│   │   ├── bull_agent.py       # Agent A — momentum + news headline sentiment
 │   │   ├── bear_agent.py       # Agent B — OBI + liquidity trap + Black Swan
 │   │   └── judge_agent.py      # Agent C — Kelly sizing + consensus gate + Alpaca execution
 │   └── execution/
@@ -106,12 +107,13 @@ Adversarial-Trading-Mesh/
 All environment variables are parsed and type-validated at startup via **Pydantic Settings**.  The application fails fast with a descriptive error rather than silently using wrong defaults.  Attempting to set `bull_threshold ≤ bear_threshold` raises a `ValidationError` immediately.
 
 ### ⚡ Async Circuit Breakers (`src/circuit_breaker.py`)
-Three-state circuit breakers (CLOSED → OPEN → HALF-OPEN) guard every external API call:
+Three-state circuit breakers (CLOSED → OPEN → HALF-OPEN) guard external API calls:
 - **`openai_circuit`** — wraps all LLM calls across Bull, Bear, Judge, and Post-Mortem nodes.
-- **`exa_circuit`** — wraps Exa.ai neural search in the Bull agent.
+- **`exa_circuit`** — wraps configured Exa.ai neural search in the Bull agent.
+- **`parallel_circuit`** — wraps Parallel Search MCP news searches in the Bull agent.
 - **`alpaca_circuit`** — wraps Alpaca order submission.
 
-When a dependency fails 5 consecutive times the circuit opens and all subsequent calls are rejected immediately (fast-fail) for 60 s before a single recovery probe is attempted.  This prevents cascade failures and LLM API quota exhaustion under partial outages.
+Failure thresholds and recovery delays come from the circuit breaker settings. Exa, Parallel and Alpaca use a lower threshold and shorter recovery delay than OpenAI. An open circuit rejects requests until its recovery interval elapses.
 
 ### 📊 In-Process Metrics (`src/metrics.py`)
 Thread-safe counters and p50/p95/p99 latency histograms are maintained in-process with zero external dependencies.  Accessible at `/api/metrics` for scraping by Prometheus exporters or log aggregators.
@@ -145,7 +147,7 @@ The in-process `asyncio.Lock` prevents concurrent post-mortem lessons from corru
 ### Agent Alpha — The Bull
 > *"You are relentlessly optimistic but intellectually honest. You believe every market dip is a buying opportunity and every consolidation is a coiled spring. You back your conviction with hard data. You are NOT reckless — your optimism is forensic."*
 
-**Signals it uses:** RSI-14, MACD histogram, Exa.ai social sentiment (neural search over recent headlines), pre-computed technical momentum score.
+**Signals it uses:** RSI-14, MACD histogram, news headline sentiment (Parallel Search MCP or configured Exa.ai), pre-computed technical momentum score.
 
 ### Agent Omega — The Bear
 > *"You are forensically skeptical. Every data point is suspect until independently verified. You have personally watched traders lose everything because they ignored order-book manipulation, thin liquidity, and macro tail risks. Your DEFAULT stance is: prove to me this isn't a trap."*
@@ -186,6 +188,34 @@ cp .env.example .env
 python main.py
 # Dashboard → http://localhost:8000
 ```
+
+### News sentiment provider
+
+The Bull agent uses [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+for free news search when no Exa key is configured. Search uses Fast mode without
+an account or API key. With `SENTIMENT_PROVIDER=auto` (the default), an existing
+`EXA_API_KEY` keeps the Exa neural-search path. Select `parallel` or `exa` to
+choose a provider explicitly, or `none` to disable all news requests, including
+cached results. Environment variables override saved `.env` values.
+
+Parallel receives the market symbol in a news query at `https://search.parallel.ai/mcp`.
+Results feed the existing title-keyword sentiment score and source URLs in
+`market_data`; this is a headline heuristic, not a prediction of trading returns.
+Parallel results are cached per symbol for `SENTIMENT_CACHE_SECS` (default 60),
+with at most 32 symbols retained. The complete MCP request has an eight-second
+deadline (`SENTIMENT_TIMEOUT_SECS`). Failures, service limits and timeouts yield
+neutral sentiment and no source URLs, cached for the same interval. They never
+switch providers. Cancellation propagates to the caller.
+
+The anonymous service is intended for light use and has rate limits. For a
+high-frequency deployment, retain your configured Exa provider or disable news
+requests with `SENTIMENT_PROVIDER=none`.
+
+### Sentiment regression checks
+
+After installing `requirements.txt`, run `python -m unittest discover -s tests -v`.
+The tests exercise the MCP HTTP transport and compiled graph with local fixtures
+and scripted model responses, so they do not need API keys or submit trades.
 
 ### Manual trigger (no WebSocket needed)
 ```bash
@@ -236,7 +266,10 @@ Technical indicators are computed **incrementally** on a rolling 50-price window
 | `OPENAI_API_KEY` | — | **Required.** Powers all three LLM agents. |
 | `LLM_MODEL` | `gpt-4o-mini` | OpenAI model identifier. |
 | `LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors. |
-| `EXA_API_KEY` | — | Optional. Enables live social sentiment in the Bull agent. |
+| `SENTIMENT_PROVIDER` | `auto` | `auto`: Exa with an existing key, otherwise Parallel MCP. Explicit `parallel`, `exa`, or `none` overrides this selection. |
+| `SENTIMENT_TIMEOUT_SECS` | `8` | Total Parallel MCP request deadline, in seconds. |
+| `SENTIMENT_CACHE_SECS` | `60` | Parallel sentiment cache lifetime per symbol, including failures. |
+| `EXA_API_KEY` | — | Keeps Exa in `auto` mode; required for explicit `exa`. |
 | `EXA_NUM_RESULTS` | `8` | Number of Exa.ai search results to fetch. |
 | `WS_SYMBOL` | `btcusdt` | Binance stream symbol. |
 | `WS_THROTTLE_SECS` | `1.0` | Minimum seconds between yielded snapshots. |
@@ -284,7 +317,7 @@ Technical indicators are computed **incrementally** on a rolling 50-price window
 | Agent orchestration | `langgraph` |
 | LLM calls | `langchain-openai` (GPT-4o-mini) |
 | Real-time feed | `websockets` (Binance) |
-| Social sentiment | `httpx` + Exa.ai Neural Search |
+| News sentiment | `mcp` + Parallel Search MCP; `httpx` + Exa.ai Neural Search when configured |
 | Technical indicators | incremental RSI/MACD (numpy) |
 | Monitoring API | `fastapi` + `uvicorn` |
 | Position sizing | Half-Kelly criterion |

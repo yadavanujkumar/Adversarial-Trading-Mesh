@@ -23,7 +23,7 @@ class MarketSnapshot(TypedDict):
     macd_line: float
     macd_signal: float
     macd_hist: float
-    sentiment_score: float         # –1 (fear) … +1 (greed); populated by Exa.ai
+    sentiment_score: float         # –1 (fear) … +1 (greed); populated by the sentiment provider
     sentiment_sources: list[str]   # headlines / links used for sentiment
 
 
